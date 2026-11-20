@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      DB_PASSWORD: ci-only-password
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Start application stack
+        run: docker compose up --build -d
+      - name: Wait for API and run smoke checks
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:8080/health; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker compose logs
+              exit 1
+            fi
+            sleep 2
+          done
+
+          user=$(curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"CI test user"}' \
+            http://localhost:8080/users)
+          user_id=$(echo "$user" | jq -r '.id')
+          test "$user_id" != "null"
+
+          curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d "{\"user_id\":$user_id,\"title\":\"CI test\",\"body\":\"Smoke test\"}" \
+            http://localhost:8080/notifications | jq -e '.id and .user_id' >/dev/null
+
+          curl --fail --silent --show-error \
+            "http://localhost:8080/notifications?user_id=$user_id" | jq -e 'length == 1' >/dev/null
+          echo "Smoke checks passed: health, user creation, and notification flow."
+      - name: Stop application stack
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and publish API image to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker build --tag "$image:$GITHUB_SHA" --tag "$image:latest" .
+          docker push "$image:$GITHUB_SHA"
+          docker push "$image:latest"
